@@ -362,10 +362,16 @@ impl ShredProcessor {
                 }
             }
             ReconstructionStatus::ReadyRecovery => {
-                if let Err(e) = Self::recover_fec(acc, reed_solomon_cache).await {
-                    error!("FEC Recovery failed unexpectedly: {:?}", e);
-                    return Ok(());
-                }
+                match Self::recover_fec(acc, reed_solomon_cache).await {
+                    Ok(()) => true,
+                    Err(e) => {
+                        warn!(
+                            "FEC recovery failed for slot {} fec_set_index {}, proceeding with partial data shreds: {:?}",
+                            fec_key.0, fec_key.1, e
+                        );
+                        false
+                    }
+                };
 
                 let acc = fec_set_accumulators.remove(&fec_key).unwrap();
                 Self::send_completed_fec_set(acc, sender, fec_key, processed_fec_sets).await?;
@@ -739,6 +745,17 @@ impl ShredProcessor {
         let shred_received_at_micros = &combined_data_meta.combined_data_shred_received_at_micros;
 
         let entry_count = u64::from_le_bytes(combined_data[0..8].try_into()?);
+        // Upstream calls `Vec::with_capacity(entry_count as usize)` directly,
+        // which causes OOM kill when garbage bytes (from partial FEC recovery
+        // or corruption) decode to a huge entry_count. Real batches contain
+        // ~1024 entries max, so 50_000 is two orders of magnitude above
+        // realistic while still rejecting obvious garbage.
+        const MAX_ENTRY_COUNT: u64 = 50_000;
+        if entry_count > MAX_ENTRY_COUNT {
+            return Err(anyhow::anyhow!(
+                "implausible entry count {entry_count} (max {MAX_ENTRY_COUNT}); rejecting batch to avoid OOM"
+            ));
+        }
         let mut cursor = Cursor::new(&combined_data);
         cursor.set_position(8);
 
