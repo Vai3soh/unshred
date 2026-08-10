@@ -106,7 +106,7 @@ impl ShredProcessor {
 
         // Spawn network receiver
         let bind_addr: std::net::SocketAddr = config.bind_address.parse()?;
-        let receiver = crate::receiver::ShredReceiver::new(bind_addr)?;
+        let receiver = crate::receiver::ShredReceiver::new(bind_addr, config.allowed_sources.clone())?;
         let receiver_handle =
             tokio::spawn(receiver.run(shred_senders, Arc::clone(&processed_fec_sets)));
 

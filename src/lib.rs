@@ -101,6 +101,14 @@ impl<H: TransactionHandler> UnshredProcessorBuilder<H> {
         self
     }
 
+    /// Restrict accepted UDP sources. Empty (default) accepts any source.
+    pub fn allowed_sources(mut self, sources: Vec<std::net::IpAddr>) -> Self {
+        let mut config = self.config.unwrap_or_default();
+        config.allowed_sources = sources;
+        self.config = Some(config);
+        self
+    }
+
     #[cfg(feature = "metrics")]
     /// Sets the Prometheus registry for metrics. `features = ["metrics"]` must be enabled.
     pub fn metrics_registry(mut self, registry: Arc<prometheus::Registry>) -> Self {

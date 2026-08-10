@@ -6,8 +6,9 @@ use anyhow::Result;
 use dashmap::DashSet;
 use socket2::{Domain, Socket, Type};
 use std::{
+    collections::HashSet,
     mem::MaybeUninit,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -21,10 +22,17 @@ const OFFSET_FEC_SET_INDEX: usize = 79;
 
 pub struct ShredReceiver {
     socket: Arc<Socket>,
+    allowed_sources: HashSet<IpAddr>,
+}
+
+/// Returns true when the given sender is allowed by the source allow-list.
+/// An empty allow-list permits any source.
+fn raw_udp_source_allowed(allowed_sources: &HashSet<IpAddr>, peer: &SocketAddr) -> bool {
+    allowed_sources.is_empty() || allowed_sources.contains(&peer.ip())
 }
 
 impl ShredReceiver {
-    pub fn new(bind_addr: SocketAddr) -> Result<Self> {
+    pub fn new(bind_addr: SocketAddr, allowed_sources: Vec<IpAddr>) -> Result<Self> {
         // UDP socket
         let socket = Socket::new(Domain::IPV4, Type::DGRAM, None)?;
 
@@ -57,6 +65,7 @@ impl ShredReceiver {
 
         Ok(Self {
             socket: Arc::new(socket),
+            allowed_sources: allowed_sources.into_iter().collect(),
         })
     }
 
@@ -70,13 +79,16 @@ impl ShredReceiver {
         info!("Starting {} network receiver workers", num_receivers);
         let mut handles = Vec::with_capacity(num_receivers);
 
+        let allowed_sources = self.allowed_sources.clone();
         for i in 0..num_receivers {
             let socket = Arc::clone(&self.socket);
             let senders = senders.clone();
             let processed_fec_sets = Arc::clone(&processed_fec_sets);
+            let allowed_sources = allowed_sources.clone();
 
             let handle = task::spawn_blocking(move || {
-                if let Err(e) = Self::receive_loop(socket, senders, processed_fec_sets) {
+                if let Err(e) = Self::receive_loop(socket, senders, processed_fec_sets, allowed_sources)
+                {
                     error!("Reciever {} failed: {}", i, e);
                 }
             });
@@ -94,21 +106,31 @@ impl ShredReceiver {
         socket: Arc<Socket>,
         senders: Vec<Sender<ShredBytesMeta>>,
         processed_fec_sets: Arc<DashSet<(u64, u32)>>,
+        allowed_sources: HashSet<IpAddr>,
     ) -> Result<()> {
         #[cfg(feature = "metrics")]
         let mut last_channel_update = std::time::Instant::now();
-        // Pre-allocate buffer
+        // Pre-allocate buffer.
         let mut buffer = vec![MaybeUninit::<u8>::uninit(); SHRED_SIZE];
 
         loop {
-            match socket.recv(&mut buffer) {
-                Ok(size) if size > 0 => {
+            // NOTE: recv_from populates the source address with essentially no
+            // extra cost versus recv() (both map to a single recvmsg on Linux),
+            // and lets us enforce the allowed_sources allow-list. An empty list
+            // accepts any source.
+            match socket.recv_from(&mut buffer) {
+                Ok((size, source)) if size > 0 => {
+                    let source_addr = source.as_socket();
+                    if source_addr.is_some_and(|addr| !raw_udp_source_allowed(&allowed_sources, &addr))
+                    {
+                        continue;
+                    }
                     let received_at_micros = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .unwrap()
                         .as_micros() as u64;
 
-                    // SAFETY: socket.recv() guarantees the first `size` bytes are initialized
+                    // SAFETY: socket.recv_from() guarantees the first `size` bytes are initialized
                     let initialized_data =
                         unsafe { std::slice::from_raw_parts(buffer.as_ptr() as *const u8, size) };
 
